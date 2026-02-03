@@ -2,6 +2,7 @@ LICENSE
 MANIFEST.in
 README.md
 pyproject.toml
+requirements.txt
 setup.py
 jaxflow/__init__.py
 jaxflow/cli.py
@@ -27,6 +28,7 @@ jaxflow_lib.egg-info/dependency_links.txt
 jaxflow_lib.egg-info/requires.txt
 jaxflow_lib.egg-info/top_level.txt
 tests/test_dataset.py
+tests/test_iterable_loader.py
 tests/test_loader.py
 tests/test_transforms.py
 tests/test_utils_manual.py

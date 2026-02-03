@@ -6,6 +6,8 @@ import time
 import queue
 import random
 import logging
+import threading
+from dataclasses import dataclass
 from typing import Iterator, Optional, List, Any, Union, Generator, Callable
 
 from .dataset import Dataset, IterableDataset
@@ -14,6 +16,22 @@ from .sampler import Sampler, SequentialSampler, RandomSampler, BatchSampler
 
 # Configure logger
 logger = logging.getLogger(__name__)
+
+@dataclass
+class WorkerInfo:
+    id: int
+    num_workers: int
+    seed: Optional[int]
+    dataset: Any
+
+_worker_info = threading.local()
+
+def get_worker_info() -> Optional[WorkerInfo]:
+    """
+    Returns information about the current worker process.
+    Returns None if called in the main process.
+    """
+    return getattr(_worker_info, 'info', None)
 
 class _MultiProcessingDataLoaderIter:
     """
@@ -45,7 +63,31 @@ class _MultiProcessingDataLoaderIter:
         if self.is_map_style:
             self._start_map_style_workers()
         else:
-            raise NotImplementedError("Multiprocessing for iterable-style datasets is not fully implemented yet.")
+            self._start_iterable_style_workers()
+
+    def _start_iterable_style_workers(self) -> None:
+        self.active_workers = self.num_workers
+        self.worker_result_queue = mp.Queue(maxsize=self.prefetch_factor * self.num_workers)
+        
+        # Start workers
+        for i in range(self.num_workers):
+            p = mp.Process(
+                target=_worker_iterable_loop,
+                args=(
+                    self.dataset,
+                    self.worker_result_queue,
+                    self.collate_fn,
+                    self.worker_init_fn,
+                    i, # worker_id
+                    self.seed,
+                    self.loader.batch_size,
+                    self.loader.drop_last,
+                    self.num_workers
+                )
+            )
+            p.daemon = True
+            p.start()
+            self.workers.append(p)
 
     def _start_map_style_workers(self) -> None:
         # 1. Get batches from batch_sampler
@@ -87,24 +129,38 @@ class _MultiProcessingDataLoaderIter:
             if self.num_batches == 0:
                  self._shutdown()
                  raise StopIteration
-                 
-            # Fetch from result queue
-            try:
-                # Get item with timeout
-                item = self.worker_result_queue.get(timeout=self.timeout) 
-            except queue.Empty:
+        else:
+            # Iterable style termination check
+            if self.active_workers == 0:
                 self._shutdown()
-                logger.error("Timeout waiting for data. Workers may have died.")
-                raise StopIteration("Timeout waiting for data. Workers may have died.")
-                
-            if isinstance(item, Exception):
-                self._shutdown()
-                raise item
-                
-            self.num_batches -= 1
+                raise StopIteration
+
+        # Fetch from result queue
+        try:
+            # Get item with timeout
+            item = self.worker_result_queue.get(timeout=self.timeout) 
+        except queue.Empty:
+            self._shutdown()
+            if self.is_map_style or self.active_workers > 0:
+                 logger.error("Timeout waiting for data. Workers may have died.")
+                 raise StopIteration("Timeout waiting for data. Workers may have died.")
+            else:
+                 raise StopIteration
             
-            # Prefetch to device (JIT-Ready Streaming)
-            return jax.device_put(item)
+        if isinstance(item, Exception):
+            self._shutdown()
+            raise item
+
+        if not self.is_map_style and item is None:
+            # Worker finished
+            self.active_workers -= 1
+            return self.__next__()
+
+        if self.is_map_style:
+            self.num_batches -= 1
+        
+        # Prefetch to device (JIT-Ready Streaming)
+        return jax.device_put(item)
             
     def _shutdown(self) -> None:
         # Terminate workers
@@ -153,6 +209,48 @@ def _worker_loop(
             # Send
             result_queue.put(batch)
             
+    except Exception as e:
+        result_queue.put(e)
+
+def _worker_iterable_loop(
+    dataset: Any,
+    result_queue: mp.Queue,
+    collate_fn: Callable,
+    worker_init_fn: Optional[Callable],
+    worker_id: int,
+    seed: Optional[int],
+    batch_size: int,
+    drop_last: bool,
+    num_workers: int
+) -> None:
+    """
+    Worker function for IterableDataset.
+    """
+    # Set worker info
+    _worker_info.info = WorkerInfo(id=worker_id, num_workers=num_workers, seed=seed, dataset=dataset)
+
+    if seed is not None:
+        np.random.seed(seed + worker_id)
+        random.seed(seed + worker_id)
+
+    if worker_init_fn is not None:
+        worker_init_fn(worker_id)
+
+    try:
+        iter_data = iter(dataset)
+        batch = []
+        for item in iter_data:
+            batch.append(item)
+            if len(batch) == batch_size:
+                result_queue.put(collate_fn(batch))
+                batch = []
+        
+        if batch and not drop_last:
+            result_queue.put(collate_fn(batch))
+            
+        # Signal done
+        result_queue.put(None)
+        
     except Exception as e:
         result_queue.put(e)
 
@@ -260,20 +358,27 @@ class Loader:
         if batch_size <= 0 and batch_sampler is None:
              raise ValueError("batch_size must be positive")
 
+        # Determine if map-style
+        is_map_style = hasattr(dataset, "__getitem__") and hasattr(dataset, "__len__")
+
         # Setup Samplers
-        if batch_sampler is not None:
-            if batch_size != 1 or shuffle or sampler is not None or drop_last:
-                raise ValueError('batch_sampler option is mutually exclusive '
-                                 'with batch_size, shuffle, sampler, and drop_last')
-            self.batch_sampler = batch_sampler
+        if is_map_style:
+            if batch_sampler is not None:
+                if batch_size != 1 or shuffle or sampler is not None or drop_last:
+                    raise ValueError('batch_sampler option is mutually exclusive '
+                                     'with batch_size, shuffle, sampler, and drop_last')
+                self.batch_sampler = batch_sampler
+            else:
+                if sampler is None:
+                    if shuffle:
+                        sampler = RandomSampler(dataset, seed=seed) # type: ignore
+                    else:
+                        sampler = SequentialSampler(dataset) # type: ignore
+                self.sampler = sampler
+                self.batch_sampler = BatchSampler(sampler, batch_size, drop_last)
         else:
-            if sampler is None:
-                if shuffle:
-                    sampler = RandomSampler(dataset, seed=seed) # type: ignore
-                else:
-                    sampler = SequentialSampler(dataset) # type: ignore
-            self.sampler = sampler
-            self.batch_sampler = BatchSampler(sampler, batch_size, drop_last)
+            self.sampler = None
+            self.batch_sampler = None
 
     def __iter__(self) -> Union[_MultiProcessingDataLoaderIter, _SingleProcessDataLoaderIter]:
         if self.num_workers > 0:

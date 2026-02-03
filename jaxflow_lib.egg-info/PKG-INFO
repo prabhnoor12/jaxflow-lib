@@ -1,6 +1,6 @@
 Metadata-Version: 2.4
 Name: jaxflow-lib
-Version: 0.1.0
+Version: 0.1.1
 Summary: High-performance, PyTree-native data loading and processing library for JAX/Flax with built-in integrations for Optax and HuggingFace
 Author-email: Prabhnoor Singh <prabhnoors093@gmail.com>
 License: MIT

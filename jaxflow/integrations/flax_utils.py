@@ -87,6 +87,38 @@ def restore_checkpoint(
 class TrainStep:
     """
     A robust helper class to wrap training steps with support for mutable state (BatchNorm).
+
+    This class simplifies the JAX training loop by handling:
+    1. Gradient computation (value_and_grad).
+    2. State updates (applying gradients).
+    3. Mutable state management (e.g., updating batch statistics for BatchNorm).
+
+    Assumption:
+        The `batch` argument passed to `__call__` must be a dictionary (or PyTree) 
+        containing keys 'x' (inputs) and 'y' (targets).
+
+    Example:
+        ```python
+        import jax
+        import jax.numpy as jnp
+        import optax
+        from jaxflow.integrations.flax_utils import TrainStep, create_train_state
+
+        # 1. Define Loss Function
+        def cross_entropy_loss(logits, labels):
+            one_hot = jax.nn.one_hot(labels, num_classes=10)
+            return optax.softmax_cross_entropy(logits=logits, labels=one_hot).mean()
+
+        # 2. Create TrainStep
+        train_step = TrainStep(loss_fn=cross_entropy_loss)
+
+        # 3. Inside Training Loop
+        # state = create_train_state(...)
+        # for batch in loader:
+        #     # batch must be {'x': ..., 'y': ...}
+        #     state, metrics = train_step(state, batch)
+        #     print(f"Loss: {metrics['loss']}")
+        ```
     """
     def __init__(self, loss_fn: Callable, has_aux: bool = False, mutables: List[str] = ['batch_stats']):
         self.loss_fn = loss_fn
