@@ -1,0 +1,7 @@
+include README.md
+include LICENSE
+include pyproject.toml
+include requirements.txt
+recursive-include jaxflow *.py
+recursive-include jaxflow *.pyi
+recursive-include jaxflow py.typed
