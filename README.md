@@ -88,7 +88,9 @@ for batch in loader:
 JaxFlow simplifies the boilerplate often associated with JAX training loops.
 
 ```python
-from jaxflow.integrations import create_train_state, get_optimizer, TrainStep
+import jax
+import optax
+from jaxflow.integrations import create_train_state, TrainStep
 import flax.linen as nn
 
 # Define a simple model
@@ -104,15 +106,20 @@ class CNN(nn.Module):
 
 # Initialize
 model = CNN()
-optimizer = get_optimizer("adamw", learning_rate=1e-3)
-state = create_train_state(model, optimizer, input_shape=(1, 28, 28, 1))
+optimizer = optax.adamw(learning_rate=1e-3)
+state = create_train_state(
+    jax.random.key(0), model, input_shape=(1, 28, 28, 1), optimizer=optimizer
+)
 
 # Define training step
-train_step = TrainStep(state)
+def loss_fn(logits, labels):
+    return optax.softmax_cross_entropy_with_integer_labels(logits, labels).mean()
+
+train_step = TrainStep(loss_fn)
 
 # Training loop
 for batch in loader:
-    state, metrics = train_step(state, batch)
+    state, metrics = train_step(state, {"x": batch["image"], "y": batch["label"]})
     print(f"Loss: {metrics['loss']}")
 ```
 
